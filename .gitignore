@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# Model checkpoints (large files)
+checkpoints/
+retinal_disease_model/
+*.zip
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Data
+data/
+*.csv
+*.xlsx
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Results
+results/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
