@@ -29,8 +29,9 @@ The primary training workflow is the Colab notebook at `notebooks/train_retinal_
 
 ## Architecture
 
-- **`src/dataset.py`** — Core data pipeline. `create_dataloaders()` is the main entry point: loads ODIR-5K annotations (.xlsx/.csv), builds per-eye records, applies stratified train/val/test split, and returns DataLoaders with a `WeightedRandomSampler` for class imbalance. Constants `DISEASE_CLASSES`, `DISEASE_CODES`, `NUM_CLASSES` are defined here and imported everywhere.
-- **`src/train.py`** — `train()` function orchestrates the training loop: creates a `ViTForImageClassification` model, uses `CrossEntropyLoss` with class weights, `AdamW` optimizer, `CosineAnnealingLR` scheduler, and early stopping. Saves best model via HuggingFace's `save_pretrained()` to `checkpoints/best_model/`. Supports MPS (Apple Silicon), CUDA, and CPU.
+- **`src/dataset.py`** — Core data pipeline. `create_hf_datasets()` is the main entry point for Trainer-based training: returns HF-compatible datasets and class weights. `create_dataloaders()` is kept for backward compatibility with `evaluate.py`. Constants `DISEASE_CLASSES`, `DISEASE_CODES`, `NUM_CLASSES` are defined here and imported everywhere.
+- **`src/train.py`** — `train()` function uses HuggingFace `Trainer` with a custom `WeightedLossTrainer` subclass for class-weighted loss. Configured with cosine LR scheduler, early stopping, and `load_best_model_at_end`. Saves best model to `checkpoints/best_model/`. Supports `--push_to_hub` for direct HuggingFace Hub upload.
+- **`src/trainer_utils.py`** — Custom Trainer utilities: `WeightedLossTrainer` (class-weighted CrossEntropyLoss), `HistoryCallback` (saves per-epoch metrics to `history.json`), and `compute_metrics` (accuracy).
 - **`src/evaluate.py`** — Generates classification report, per-class AUC (one-vs-rest), confusion matrix plot, and training curve plots. Outputs go to `results/`.
 - **`src/predict.py`** — Single-image inference. `predict_image()` returns predicted class, confidence, and all probabilities.
 - **`app/gradio_app.py`** — Web demo. Adds `src/` to `sys.path` to import from dataset module. Includes disease descriptions and risk levels in the UI.
@@ -39,5 +40,5 @@ The primary training workflow is the Colab notebook at `notebooks/train_retinal_
 
 - All scripts use relative imports from `src/dataset.py` — the Gradio app achieves this via `sys.path.insert`. When running `src/` scripts, run them from within the `src/` directory or ensure `src/` is on the Python path.
 - Model checkpoints, data files, and results are gitignored (see `.gitignore`). Only code and the notebook are tracked.
-- The model uses HuggingFace's `ViTForImageClassification` with `ignore_mismatched_sizes=True` to replace the classification head. Models are saved/loaded via `save_pretrained()`/`from_pretrained()`.
+- The model uses HuggingFace's `ViTForImageClassification` with `ignore_mismatched_sizes=True` to replace the classification head. Models are saved/loaded via `save_pretrained()`/`from_pretrained()`. Label mappings are set in `model.config.id2label`/`label2id` for Hub compatibility.
 - ImageNet normalization (mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) is used for all transforms.

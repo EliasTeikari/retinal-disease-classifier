@@ -220,3 +220,55 @@ def create_dataloaders(data_dir, batch_size=32, image_size=224, val_split=0.15, 
     )
 
     return train_loader, val_loader, test_loader, class_weights
+
+
+class RetinalDiseaseHFDataset(Dataset):
+    """Dataset returning dicts compatible with HuggingFace Trainer."""
+
+    def __init__(self, dataframe, transform=None):
+        self.dataframe = dataframe.reset_index(drop=True)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):
+        row = self.dataframe.iloc[idx]
+        image = Image.open(row["image_path"]).convert("RGB")
+        label = row["label"]
+
+        if self.transform:
+            image = self.transform(image)
+
+        return {"pixel_values": image, "labels": label}
+
+
+def create_hf_datasets(data_dir, image_size=224, val_split=0.15, test_split=0.1, seed=42):
+    """
+    Create train/val/test datasets compatible with HuggingFace Trainer.
+
+    Returns:
+        train_dataset, val_dataset, test_dataset, class_weights
+    """
+    df = load_odir_dataset(data_dir)
+
+    from sklearn.model_selection import train_test_split
+
+    train_df, temp_df = train_test_split(
+        df, test_size=val_split + test_split, stratify=df["label"], random_state=seed
+    )
+    relative_test = test_split / (val_split + test_split)
+    val_df, test_df = train_test_split(
+        temp_df, test_size=relative_test, stratify=temp_df["label"], random_state=seed
+    )
+
+    print(f"\nSplit sizes — Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
+
+    train_dataset = RetinalDiseaseHFDataset(train_df, transform=get_train_transforms(image_size))
+    val_dataset = RetinalDiseaseHFDataset(val_df, transform=get_val_transforms(image_size))
+    test_dataset = RetinalDiseaseHFDataset(test_df, transform=get_val_transforms(image_size))
+
+    train_labels = train_df["label"].values
+    class_weights = compute_class_weights(train_labels)
+
+    return train_dataset, val_dataset, test_dataset, class_weights

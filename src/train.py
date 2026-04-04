@@ -1,19 +1,21 @@
 """
 Training script for retinal disease classification using ViT.
+Uses HuggingFace Trainer for training orchestration.
 Can be run standalone or imported by the Colab notebook.
 """
 
 import os
 import argparse
-import torch
-import torch.nn as nn
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from transformers import ViTForImageClassification, ViTImageProcessor
-from tqdm import tqdm
 import json
+import torch
+from transformers import (
+    ViTForImageClassification,
+    TrainingArguments,
+    EarlyStoppingCallback,
+)
 
-from dataset import create_dataloaders, DISEASE_CLASSES, NUM_CLASSES
+from dataset import create_hf_datasets, DISEASE_CLASSES, NUM_CLASSES
+from trainer_utils import WeightedLossTrainer, HistoryCallback, compute_metrics
 
 
 def create_model(num_classes=NUM_CLASSES, pretrained="google/vit-base-patch16-224", freeze_backbone=False):
@@ -31,8 +33,11 @@ def create_model(num_classes=NUM_CLASSES, pretrained="google/vit-base-patch16-22
         ignore_mismatched_sizes=True,
     )
 
+    # Set label mapping in model config for push_to_hub compatibility
+    model.config.id2label = {i: name for i, name in enumerate(DISEASE_CLASSES)}
+    model.config.label2id = {name: i for i, name in enumerate(DISEASE_CLASSES)}
+
     if freeze_backbone:
-        # Freeze everything except the classification head
         for name, param in model.named_parameters():
             if "classifier" not in name:
                 param.requires_grad = False
@@ -43,55 +48,6 @@ def create_model(num_classes=NUM_CLASSES, pretrained="google/vit-base-patch16-22
     print(f"Parameters — Total: {total:,}, Trainable: {trainable:,} ({100*trainable/total:.1f}%)")
 
     return model
-
-
-def train_one_epoch(model, loader, criterion, optimizer, device, epoch, num_epochs):
-    model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-
-    pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")
-    for images, labels in pbar:
-        images, labels = images.to(device), labels.to(device)
-
-        optimizer.zero_grad()
-        outputs = model(images).logits
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-
-        running_loss += loss.item() * images.size(0)
-        _, predicted = outputs.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
-
-        pbar.set_postfix({
-            "loss": f"{running_loss/total:.4f}",
-            "acc": f"{100.*correct/total:.2f}%",
-        })
-
-    return running_loss / total, correct / total
-
-
-@torch.no_grad()
-def validate(model, loader, criterion, device):
-    model.eval()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-
-    for images, labels in loader:
-        images, labels = images.to(device), labels.to(device)
-        outputs = model(images).logits
-        loss = criterion(outputs, labels)
-
-        running_loss += loss.item() * images.size(0)
-        _, predicted = outputs.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
-
-    return running_loss / total, correct / total
 
 
 def train(
@@ -106,84 +62,80 @@ def train(
     image_size=224,
     fp16=True,
     patience=5,
+    push_to_hub=False,
+    hub_model_id=None,
 ):
-    """Main training function."""
+    """Main training function using HuggingFace Trainer."""
     os.makedirs(output_dir, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"Using device: {device}")
 
     # Data
-    train_loader, val_loader, test_loader, class_weights = create_dataloaders(
-        data_dir, batch_size=batch_size, image_size=image_size,
+    train_dataset, val_dataset, test_dataset, class_weights = create_hf_datasets(
+        data_dir, image_size=image_size,
     )
 
     # Model
     model = create_model(NUM_CLASSES, pretrained, freeze_backbone)
-    model = model.to(device)
 
-    # Loss with class weights for imbalanced data
-    criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
-
-    # Optimizer
-    optimizer = AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=lr,
+    # Training arguments
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        num_train_epochs=epochs,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        learning_rate=lr,
         weight_decay=weight_decay,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.0,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        logging_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="accuracy",
+        greater_is_better=True,
+        save_total_limit=2,
+        fp16=fp16,
+        dataloader_num_workers=2,
+        dataloader_pin_memory=True,
+        push_to_hub=push_to_hub,
+        hub_model_id=hub_model_id,
+        report_to="none",
     )
 
-    # Scheduler
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr * 0.01)
+    # Callbacks
+    history_callback = HistoryCallback(output_dir)
+    early_stopping = EarlyStoppingCallback(early_stopping_patience=patience)
 
-    # Mixed precision
-    scaler = torch.amp.GradScaler(enabled=fp16 and device.type == "cuda")
+    # Trainer with class-weighted loss
+    trainer = WeightedLossTrainer(
+        class_weights=class_weights,
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        compute_metrics=compute_metrics,
+        callbacks=[history_callback, early_stopping],
+    )
 
-    # Training loop
-    best_val_acc = 0.0
-    no_improve = 0
-    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+    # Train
+    trainer.train()
 
-    for epoch in range(epochs):
-        train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, epoch, epochs,
-        )
-        val_loss, val_acc = validate(model, val_loader, criterion, device)
-        scheduler.step()
-
-        history["train_loss"].append(train_loss)
-        history["train_acc"].append(train_acc)
-        history["val_loss"].append(val_loss)
-        history["val_acc"].append(val_acc)
-
-        print(
-            f"Epoch {epoch+1}/{epochs} — "
-            f"Train Loss: {train_loss:.4f}, Train Acc: {100*train_acc:.2f}% | "
-            f"Val Loss: {val_loss:.4f}, Val Acc: {100*val_acc:.2f}%"
-        )
-
-        # Save best model
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            no_improve = 0
-            model.save_pretrained(os.path.join(output_dir, "best_model"))
-            print(f"  -> New best model saved (val_acc: {100*val_acc:.2f}%)")
-        else:
-            no_improve += 1
-
-        if no_improve >= patience:
-            print(f"Early stopping after {patience} epochs without improvement")
-            break
-
-    # Save training history
-    with open(os.path.join(output_dir, "history.json"), "w") as f:
-        json.dump(history, f, indent=2)
+    # Save best model
+    best_model_dir = os.path.join(output_dir, "best_model")
+    trainer.save_model(best_model_dir)
 
     # Save label mapping
     label_map = {i: name for i, name in enumerate(DISEASE_CLASSES)}
-    with open(os.path.join(output_dir, "best_model", "label_map.json"), "w") as f:
+    with open(os.path.join(best_model_dir, "label_map.json"), "w") as f:
         json.dump(label_map, f, indent=2)
 
+    # Push to Hub
+    if push_to_hub:
+        trainer.push_to_hub()
+
+    history = history_callback.get_history()
+    best_val_acc = max(history["val_acc"]) if history["val_acc"] else 0.0
     print(f"\nTraining complete. Best validation accuracy: {100*best_val_acc:.2f}%")
-    print(f"Model saved to {os.path.join(output_dir, 'best_model')}")
+    print(f"Model saved to {best_model_dir}")
 
     return model, history
 
@@ -200,6 +152,8 @@ if __name__ == "__main__":
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--no_fp16", action="store_true")
     parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--push_to_hub", action="store_true", help="Push model to HuggingFace Hub")
+    parser.add_argument("--hub_model_id", type=str, default=None, help="HuggingFace Hub model ID")
     args = parser.parse_args()
 
     train(
@@ -213,4 +167,6 @@ if __name__ == "__main__":
         image_size=args.image_size,
         fp16=not args.no_fp16,
         patience=args.patience,
+        push_to_hub=args.push_to_hub,
+        hub_model_id=args.hub_model_id,
     )
