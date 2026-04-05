@@ -6,37 +6,23 @@ Handles loading, preprocessing, augmentation, and class balancing.
 import os
 import pandas as pd
 import numpy as np
-from PIL import Image
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from torchvision import transforms
-import torch
+from torch.utils.data import DataLoader
+
+# Import shared utilities and re-export for backward compatibility
+from data_utils import (
+    get_train_transforms,
+    get_val_transforms,
+    ImageClassificationDataset as RetinalDiseaseDataset,
+    HFImageClassificationDataset as RetinalDiseaseHFDataset,
+    compute_class_weights,
+    get_weighted_sampler,
+)
 
 
 # ODIR-5K disease labels
 DISEASE_CLASSES = ["Normal", "Diabetes", "Glaucoma", "Cataract", "AMD", "Hypertension", "Myopia", "Other"]
 DISEASE_CODES = ["N", "D", "G", "C", "A", "H", "M", "O"]
 NUM_CLASSES = len(DISEASE_CLASSES)
-
-
-def get_train_transforms(image_size=224):
-    return transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomVerticalFlip(p=0.5),
-        transforms.RandomRotation(15),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.05),
-        transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-
-
-def get_val_transforms(image_size=224):
-    return transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
 
 
 def parse_odir_labels(row):
@@ -101,7 +87,6 @@ def load_odir_dataset(data_dir):
 
     # Build dataset entries (one per eye image)
     records = []
-    label_cols = ["N", "D", "G", "C", "A", "H", "M", "O"]
 
     for _, row in df.iterrows():
         label = parse_odir_labels(row)
@@ -134,46 +119,6 @@ def load_odir_dataset(data_dir):
     return result_df
 
 
-class RetinalDiseaseDataset(Dataset):
-    """PyTorch Dataset for retinal fundus images."""
-
-    def __init__(self, dataframe, transform=None):
-        self.dataframe = dataframe.reset_index(drop=True)
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.dataframe)
-
-    def __getitem__(self, idx):
-        row = self.dataframe.iloc[idx]
-        image = Image.open(row["image_path"]).convert("RGB")
-        label = row["label"]
-
-        if self.transform:
-            image = self.transform(image)
-
-        return image, label
-
-
-def compute_class_weights(labels):
-    """Compute inverse frequency class weights for imbalanced classes."""
-    class_counts = np.bincount(labels, minlength=NUM_CLASSES).astype(np.float32)
-    # Avoid division by zero for classes with no samples
-    class_counts = np.maximum(class_counts, 1.0)
-    weights = 1.0 / class_counts
-    weights = weights / weights.sum() * NUM_CLASSES
-    return torch.FloatTensor(weights)
-
-
-def get_weighted_sampler(labels):
-    """Create a WeightedRandomSampler for balanced training."""
-    class_counts = np.bincount(labels, minlength=NUM_CLASSES).astype(np.float32)
-    class_counts = np.maximum(class_counts, 1.0)
-    sample_weights = 1.0 / class_counts[labels]
-    sample_weights = torch.DoubleTensor(sample_weights)
-    return WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
-
-
 def create_dataloaders(data_dir, batch_size=32, image_size=224, val_split=0.15, test_split=0.1, num_workers=2, seed=42):
     """
     Create train/val/test dataloaders from ODIR dataset.
@@ -203,8 +148,8 @@ def create_dataloaders(data_dir, batch_size=32, image_size=224, val_split=0.15, 
 
     # Compute class weights and sampler for training
     train_labels = train_df["label"].values
-    class_weights = compute_class_weights(train_labels)
-    sampler = get_weighted_sampler(train_labels)
+    class_weights = compute_class_weights(train_labels, NUM_CLASSES)
+    sampler = get_weighted_sampler(train_labels, NUM_CLASSES)
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, sampler=sampler,
@@ -220,27 +165,6 @@ def create_dataloaders(data_dir, batch_size=32, image_size=224, val_split=0.15, 
     )
 
     return train_loader, val_loader, test_loader, class_weights
-
-
-class RetinalDiseaseHFDataset(Dataset):
-    """Dataset returning dicts compatible with HuggingFace Trainer."""
-
-    def __init__(self, dataframe, transform=None):
-        self.dataframe = dataframe.reset_index(drop=True)
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.dataframe)
-
-    def __getitem__(self, idx):
-        row = self.dataframe.iloc[idx]
-        image = Image.open(row["image_path"]).convert("RGB")
-        label = row["label"]
-
-        if self.transform:
-            image = self.transform(image)
-
-        return {"pixel_values": image, "labels": label}
 
 
 def create_hf_datasets(data_dir, image_size=224, val_split=0.15, test_split=0.1, seed=42):
@@ -269,6 +193,6 @@ def create_hf_datasets(data_dir, image_size=224, val_split=0.15, test_split=0.1,
     test_dataset = RetinalDiseaseHFDataset(test_df, transform=get_val_transforms(image_size))
 
     train_labels = train_df["label"].values
-    class_weights = compute_class_weights(train_labels)
+    class_weights = compute_class_weights(train_labels, NUM_CLASSES)
 
     return train_dataset, val_dataset, test_dataset, class_weights

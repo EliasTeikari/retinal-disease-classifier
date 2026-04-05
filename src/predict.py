@@ -1,5 +1,6 @@
 """
-Single-image inference script for retinal disease prediction.
+Single-image inference script for image classification.
+Supports any trained model (ODIR fundus or Kermany OCT) via label_map.json or model config.
 """
 
 import os
@@ -8,9 +9,8 @@ import argparse
 import torch
 from PIL import Image
 from transformers import ViTForImageClassification
-from torchvision import transforms
 
-from dataset import DISEASE_CLASSES, get_val_transforms
+from data_utils import get_val_transforms
 
 
 def load_model(model_dir, device=None):
@@ -22,12 +22,15 @@ def load_model(model_dir, device=None):
     model = model.to(device)
     model.eval()
 
-    # Load label map if available
+    # Load label map: label_map.json > model config > fallback
     label_map_path = os.path.join(model_dir, "label_map.json")
     if os.path.exists(label_map_path):
         with open(label_map_path) as f:
             label_map = {int(k): v for k, v in json.load(f).items()}
+    elif model.config.id2label and len(model.config.id2label) > 0:
+        label_map = {int(k): v for k, v in model.config.id2label.items()}
     else:
+        from dataset import DISEASE_CLASSES
         label_map = {i: name for i, name in enumerate(DISEASE_CLASSES)}
 
     return model, label_map, device
@@ -36,7 +39,7 @@ def load_model(model_dir, device=None):
 @torch.no_grad()
 def predict_image(image_path, model, label_map, device, image_size=224):
     """
-    Predict disease from a single fundus image.
+    Predict class from a single image.
 
     Returns:
         dict with keys: predicted_class, confidence, all_probabilities
@@ -77,8 +80,8 @@ def format_prediction(result):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Predict eye disease from fundus image")
-    parser.add_argument("image_path", type=str, help="Path to fundus image")
+    parser = argparse.ArgumentParser(description="Predict from a single image")
+    parser.add_argument("image_path", type=str, help="Path to image")
     parser.add_argument("--model_dir", type=str, default="checkpoints/best_model", help="Path to model directory")
     args = parser.parse_args()
 

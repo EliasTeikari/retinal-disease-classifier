@@ -1,5 +1,6 @@
 """
 Evaluation script — load a trained model and generate metrics, confusion matrix, and classification report.
+Supports both ODIR (fundus) and Kermany OCT models. Auto-detects class names from model config.
 """
 
 import os
@@ -12,8 +13,6 @@ import seaborn as sns
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
 from transformers import ViTForImageClassification
 from tqdm import tqdm
-
-from dataset import create_dataloaders, DISEASE_CLASSES, NUM_CLASSES
 
 
 @torch.no_grad()
@@ -50,7 +49,7 @@ def plot_confusion_matrix(y_true, y_pred, class_names, save_path=None):
     )
     plt.xlabel("Predicted")
     plt.ylabel("True")
-    plt.title("Confusion Matrix — Retinal Disease Classification")
+    plt.title("Confusion Matrix")
     plt.tight_layout()
 
     if save_path:
@@ -91,26 +90,48 @@ def plot_training_history(history_path, save_path=None):
     plt.show()
 
 
-def evaluate(model_dir, data_dir, output_dir="results", batch_size=32, image_size=224):
+def evaluate(model_dir, data_dir, output_dir="results", dataset_type="odir", batch_size=32, image_size=224):
     """Full evaluation pipeline."""
     os.makedirs(output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load model
+    # Load model and derive class info from config
     model = ViTForImageClassification.from_pretrained(model_dir)
     model = model.to(device)
 
+    # Auto-detect class names from model config
+    if model.config.id2label and len(model.config.id2label) > 0:
+        class_names = [model.config.id2label[i] for i in range(len(model.config.id2label))]
+        num_classes = len(class_names)
+        print(f"Detected {num_classes} classes from model config: {class_names}")
+    else:
+        # Fallback to dataset-specific defaults
+        if dataset_type == "oct":
+            from oct_dataset import OCT_CLASSES
+            class_names = OCT_CLASSES
+        else:
+            from dataset import DISEASE_CLASSES
+            class_names = DISEASE_CLASSES
+        num_classes = len(class_names)
+
     # Load test data
-    _, _, test_loader, _ = create_dataloaders(
-        data_dir, batch_size=batch_size, image_size=image_size,
-    )
+    if dataset_type == "oct":
+        from oct_dataset import create_oct_dataloaders
+        _, _, test_loader, _ = create_oct_dataloaders(
+            data_dir, batch_size=batch_size, image_size=image_size,
+        )
+    else:
+        from dataset import create_dataloaders
+        _, _, test_loader, _ = create_dataloaders(
+            data_dir, batch_size=batch_size, image_size=image_size,
+        )
 
     # Get predictions
     y_pred, y_true, y_probs = get_predictions(model, test_loader, device)
 
     # Classification report
-    report = classification_report(y_true, y_pred, target_names=DISEASE_CLASSES, digits=4)
+    report = classification_report(y_true, y_pred, target_names=class_names, digits=4)
     print("\n" + "=" * 60)
     print("CLASSIFICATION REPORT")
     print("=" * 60)
@@ -120,11 +141,11 @@ def evaluate(model_dir, data_dir, output_dir="results", batch_size=32, image_siz
         f.write(report)
 
     # Per-class AUC (one-vs-rest)
+    auc_scores = {}
     try:
         from sklearn.preprocessing import label_binarize
-        y_true_bin = label_binarize(y_true, classes=list(range(NUM_CLASSES)))
-        auc_scores = {}
-        for i, name in enumerate(DISEASE_CLASSES):
+        y_true_bin = label_binarize(y_true, classes=list(range(num_classes)))
+        for i, name in enumerate(class_names):
             if y_true_bin[:, i].sum() > 0:
                 auc = roc_auc_score(y_true_bin[:, i], y_probs[:, i])
                 auc_scores[name] = auc
@@ -136,7 +157,7 @@ def evaluate(model_dir, data_dir, output_dir="results", batch_size=32, image_siz
 
     # Confusion matrix
     plot_confusion_matrix(
-        y_true, y_pred, DISEASE_CLASSES,
+        y_true, y_pred, class_names,
         save_path=os.path.join(output_dir, "confusion_matrix.png"),
     )
 
@@ -156,7 +177,7 @@ def evaluate(model_dir, data_dir, output_dir="results", batch_size=32, image_siz
     results = {
         "accuracy": float(accuracy),
         "num_test_samples": len(y_true),
-        "per_class_auc": {k: float(v) for k, v in auc_scores.items()} if "auc_scores" in dir() else {},
+        "per_class_auc": {k: float(v) for k, v in auc_scores.items()},
     }
     with open(os.path.join(output_dir, "results.json"), "w") as f:
         json.dump(results, f, indent=2)
@@ -165,11 +186,13 @@ def evaluate(model_dir, data_dir, output_dir="results", batch_size=32, image_siz
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate retinal disease classifier")
+    parser = argparse.ArgumentParser(description="Evaluate image classifier")
     parser.add_argument("--model_dir", type=str, required=True, help="Path to saved model directory")
-    parser.add_argument("--data_dir", type=str, required=True, help="Path to ODIR dataset directory")
+    parser.add_argument("--data_dir", type=str, required=True, help="Path to dataset directory")
+    parser.add_argument("--dataset", type=str, default="odir", choices=["odir", "oct"],
+                        help="Dataset type: 'odir' for fundus, 'oct' for Kermany OCT")
     parser.add_argument("--output_dir", type=str, default="results")
     parser.add_argument("--batch_size", type=int, default=32)
     args = parser.parse_args()
 
-    evaluate(args.model_dir, args.data_dir, args.output_dir, args.batch_size)
+    evaluate(args.model_dir, args.data_dir, args.output_dir, args.dataset, args.batch_size)
